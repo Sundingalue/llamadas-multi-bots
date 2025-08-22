@@ -123,13 +123,12 @@ async def openai_connect(bot_key: str):
     session_update = {
         "type": "session.update",
         "session": {
-            "voice": bot.get("voice", VOICE),
+            "voice": bot.get("voice", VOICE),   # ✅ Aquí definimos la voz (ej. nova)
             "modalities": ["text", "audio"],
             "input_audio_format": {
                 "type": "g711_ulaw",
                 "sample_rate": 8000
             },
-            "audio": {"voice": bot.get("voice", VOICE)},
             "audio_out": {
                 "format": "mulaw",
                 "sample_rate": 8000
