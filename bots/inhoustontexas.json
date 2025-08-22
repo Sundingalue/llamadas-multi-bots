@@ -1,7 +1,7 @@
 {
   "name": "Sara",
   "business_name": "In Houston Texas",
-  "voice": "nova",
+  "voice": "alloy",
   "realtime_model": "gpt-4o-realtime-preview",
   "greeting": "¡Hola, Soy Sara, representante de ventas de In Houston Texas! ¿Con quién tengo el gusto?",
   "voice_greeting": "¡Hola! Soy Sara, de In Houston Texas. Qué gusto saludarte, ¿cómo estás?",
