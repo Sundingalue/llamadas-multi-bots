@@ -3,14 +3,14 @@
 # - WS: /media-stream (acepta 'audio', carga bot por query ?bot=...)
 # - Enrutamiento por número: NUMBER_TO_BOT
 # - Normaliza voz (si el JSON trae algo no soportado, usa 'alloy')
-# - Audio OUT: g711_ulaw (8000 Hz)
+# - Audio OUT solicitado: g711_ulaw (8000 Hz); si Realtime lo rechaza, veremos el error en logs
 
 import os, json, time, pathlib, threading, asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect
-import websocket as wsclient  # websocket-client (cliente WS hacia OpenAI)
+import websocket as wsclient  # websocket-client
 
 load_dotenv()
 app = FastAPI()
@@ -23,7 +23,7 @@ NUMBER_TO_BOT = {
 }
 DEFAULT_BOT = "inhoustontexas"
 
-# URLs públicas (puedes dejarlas así o sobreescribir con env)
+# URLs públicas (ajusta si usas dominios propios)
 PUBLIC_WS_BASE   = os.environ.get("PUBLIC_WS_BASE",   "wss://llamadas-multi-bots.onrender.com")
 PUBLIC_HTTP_BASE = os.environ.get("PUBLIC_HTTP_BASE", "https://llamadas-multi-bots.onrender.com")
 
@@ -47,11 +47,10 @@ def _pick(cfg: dict, keys):
     return None
 
 def normalize_voice(v: str) -> str:
-    """Voces aceptadas por Realtime: usa 'alloy' si llega algo no soportado (p.ej. 'nova')."""
+    """Voces aceptadas por Realtime: usa 'alloy' si llega algo no soportado (p.ej. 'nova', 'Polly.Mia')."""
     if not v:
         return "alloy"
     vlow = v.lower().strip()
-    # lista corta conocida; ajusta si quieres otras
     supported = {"alloy", "verse", "aria", "sage"}
     if vlow in supported:
         return vlow
@@ -112,7 +111,7 @@ async def voice(request: Request):
     vr.say("Conectando.", language="es-ES", voice="Polly.Mia")
 
     connect = Connect()
-    # SIN 'track' con <Connect><Stream> (evita Invalid Track Configuration)
+    # SIN 'track' en <Connect><Stream> (evita Invalid Track Configuration)
     connect.stream(
         url=ws_url,
         status_callback=f"{PUBLIC_HTTP_BASE}/twilio/stream-status",
@@ -187,10 +186,11 @@ async def media_stream(websocket: WebSocket):
                 raw = ws_ai.recv()
                 if not raw:
                     break
+                # Intenta parsear, si falla, log raw
                 try:
                     payload = json.loads(raw)
                 except Exception:
-                    print("[AI] (binario o no-JSON)")
+                    print(f"[AI] (no-JSON/raw): {raw[:120]}...")
                     continue
 
                 mtype = payload.get("type")
@@ -211,11 +211,18 @@ async def media_stream(websocket: WebSocket):
                             "mark": {"name": "ai_response_done"}
                         })
                 elif mtype == "error":
-                    # Log completo del error de OpenAI (clave para depurar)
-                    print(f"[AI] ❌ error payload: {json.dumps(payload, ensure_ascii=False)}")
+                    # LOG COMPLETO DEL ERROR
+                    try:
+                        print(f"[AI] ❌ error payload: {json.dumps(payload, ensure_ascii=False)}")
+                    except Exception:
+                        print(f"[AI] ❌ error payload (raw): {payload}")
                 else:
-                    # Loguear otros tipos para diagnóstico (session.created, etc.)
-                    print(f"[AI] ← {mtype}: {json.dumps(payload, ensure_ascii=False)[:500]}")
+                    # Info útil (session.created, etc.)
+                    try:
+                        snippet = json.dumps(payload, ensure_ascii=False)[:500]
+                    except Exception:
+                        snippet = str(payload)[:500]
+                    print(f"[AI] ← {mtype}: {snippet}")
         except Exception as e:
             print(f"[AI] ❌ Error leyendo WS Realtime: {e}")
 
@@ -240,18 +247,16 @@ async def media_stream(websocket: WebSocket):
                     ws_ai = openai_ws_connect(MODEL)
                     print("[AI] ✅ Conectado a OpenAI Realtime.")
 
-                    # Configurar sesión con voz e instrucciones (g711_ulaw / 8k)
+                    # 🔑 Mínimo válido: SOLO 'voice' e 'instructions'
                     openai_send(ws_ai, {
                         "type": "session.update",
                         "session": {
                             "voice": VOICE,
-                            "audio_format": "g711_ulaw",
-                            "sample_rate": 8000,
                             "instructions": INSTRUCTIONS
                         }
                     })
 
-                    # Saludo inicial
+                    # Primer output (pedimos g711_ulaw/8k; si no es válido, veremos error payload)
                     openai_send(ws_ai, {
                         "type": "response.create",
                         "response": {
@@ -271,7 +276,7 @@ async def media_stream(websocket: WebSocket):
                     print(f"[AI] ❌ No se pudo conectar a OpenAI Realtime: {e}")
 
             elif etype == "media":
-                # TODO: enviar audio entrante a OpenAI (cuando habilitemos ASR/voice-in)
+                # TODO: cuando quieras, enviamos audio entrante a OpenAI
                 pass
 
             elif etype == "stop":
