@@ -3,7 +3,6 @@
 
 import os
 import json
-import base64
 import asyncio
 import websockets
 from typing import Dict, Any
@@ -19,12 +18,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 VOICE = os.getenv("OPENAI_VOICE", "alloy")
 
-APP_URL = os.getenv("APP_URL")  # p.ej. https://llamadas-multi-bots.onrender.com
+APP_URL = os.getenv("APP_URL")  # ej: https://llamadas-multi-bots.onrender.com
 if not APP_URL:
-    # Render la setea en RENDER_EXTERNAL_URL; si no, usa dummy que Twilio no usará.
     APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://example.invalid")
 
-# Bots simples en memoria (puedes mover a /bots/*.json si quieres)
+# Bots en memoria
 BOTS: Dict[str, Dict[str, Any]] = {
     "inhoustontx": {
         "name": "Sara",
@@ -55,27 +53,21 @@ async def root():
 @app.post("/voice")
 async def voice(request: Request):
     """
-    Twilio (Voice Webhook): responde TwiML para abrir el Media Stream
+    Twilio Voice Webhook: responde TwiML para abrir Media Stream
     hacia nuestro WebSocket /media-stream.
-    Usa both_tracks para audio ida/vuelta (requiere habilitación en Twilio).
     """
     params = dict(request.query_params)
     bot = params.get("bot", "inhoustontx")
     stream_url = f"{APP_URL.replace('http://', 'https://')}/media-stream?bot={bot}"
 
-    # Si aún no te habilitan both_tracks, cambia a inbound_track para probar:
-    track = "both_tracks"  # o "inbound_track"
+    # ✅ Usar inbound_audio (seguro). both_tracks requiere habilitación especial.
+    track = "inbound_audio"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="es-ES" voice="Polly.Mia">Conectando con el asistente en tiempo real.</Say>
   <Connect>
-    <Stream
-      url="{stream_url}"
-      track="{track}"
-      statusCallbackEvent="start stop mark clear"
-      statusCallbackMethod="POST"
-      statusCallback="{APP_URL}/twilio/stream-status?bot={bot}"/>
+    <Stream url="{stream_url}" track="{track}" />
   </Connect>
 </Response>
 """
@@ -84,9 +76,7 @@ async def voice(request: Request):
 
 @app.post("/twilio/stream-status")
 async def stream_status(request: Request):
-    """
-    Solo para depurar: Twilio nos manda eventos del stream.
-    """
+    """Twilio envía eventos del stream aquí (opcional para depurar)."""
     body = await request.body()
     try:
         text = body.decode("utf-8", errors="ignore")
@@ -101,36 +91,28 @@ async def stream_status(request: Request):
 # =========================
 
 async def openai_connect(bot_key: str):
-    """
-    Abre WebSocket con OpenAI Realtime.
-    Devuelve la conexión ws lista para usar.
-    """
+    """Abre WebSocket con OpenAI Realtime y configura la sesión."""
     url = f"wss://api.openai.com/v1/realtime?model={MODEL}"
     headers = [
         ("Authorization", f"Bearer {OPENAI_API_KEY}"),
         ("OpenAI-Beta", "realtime=v1"),
     ]
     ws = await websockets.connect(url, extra_headers=headers, max_size=16 * 1024 * 1024)
-    # Config de sesión (modalidades, voz y formatos de audio)
     bot = BOTS.get(bot_key, BOTS["inhoustontx"])
     session_update = {
         "type": "session.update",
         "session": {
             "voice": VOICE,
             "modalities": ["text", "audio"],
-            # Enviar y recibir μ-law 8k (compatible con Twilio)
             "input_audio_format": {
                 "type": "g711_ulaw",
                 "sample_rate": 8000
             },
-            "audio": {
-                "voice": VOICE
-            },
+            "audio": {"voice": VOICE},
             "audio_out": {
                 "format": "mulaw",
                 "sample_rate": 8000
             },
-            # Instrucciones (personalidad)
             "instructions": bot["instructions"]
         }
     }
@@ -139,26 +121,21 @@ async def openai_connect(bot_key: str):
 
 
 async def pump_twilio_to_openai(twilio_ws: WebSocket, openai_ws, stream_sid: str):
-    """
-    Lee mensajes de Twilio y envía audio (ulaw base64) a OpenAI.
-    Cuando Twilio manda 'mark' (fin de turno), pedimos respuesta a OpenAI.
-    """
+    """Pasa audio de Twilio → OpenAI."""
     while True:
         msg = await twilio_ws.receive_text()
         data = json.loads(msg)
-
         event = data.get("event")
+
         if event == "start":
             print(f"[WS] ▶️ start streamSid={stream_sid}")
         elif event == "media":
-            # Audio μ-law base64 desde Twilio
             ulaw_b64 = data["media"]["payload"]
             await openai_ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
                 "audio": ulaw_b64
             }))
         elif event == "mark":
-            # Twilio marcó fin de utterance (si usas marks)
             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await openai_ws.send(json.dumps({
                 "type": "response.create",
@@ -166,25 +143,18 @@ async def pump_twilio_to_openai(twilio_ws: WebSocket, openai_ws, stream_sid: str
             }))
         elif event == "stop":
             print(f"[WS] ⏹ stop streamSid={stream_sid}")
-            # Cierra ordenadamente
             await openai_ws.close()
             await twilio_ws.close()
             break
-        else:
-            # Otros eventos (clear, etc.)
-            pass
 
 
 async def pump_openai_to_twilio(openai_ws, twilio_ws: WebSocket, stream_sid: str):
-    """
-    Lee eventos de OpenAI y reenvía audio Δ a Twilio (μ-law base64).
-    """
+    """Pasa audio de OpenAI → Twilio."""
     try:
         async for raw in openai_ws:
             try:
                 evt = json.loads(raw)
             except Exception:
-                # Algunos frames podrían venir como binarios (rarísimo hoy), ignoramos
                 continue
 
             t = evt.get("type")
@@ -195,24 +165,9 @@ async def pump_openai_to_twilio(openai_ws, twilio_ws: WebSocket, stream_sid: str
                     "streamSid": stream_sid,
                     "media": {"payload": mulaw_b64}
                 }))
-            elif t == "response.audio.done":
-                # Fin del audio de esta respuesta
-                pass
-            elif t == "response.done":
-                pass
             elif t == "error":
-                print(f"[AI] ❌ error payload: {evt}")
-            elif t == "session.updated":
-                pass
-            elif t == "session.created":
-                pass
-            else:
-                # Para depurar otros tipos:
-                # print(f"[AI] ← {t}: {evt}")
-                pass
-
+                print(f"[AI] ❌ error: {evt}")
     except websockets.ConnectionClosed:
-        # OpenAI cerró
         try:
             await twilio_ws.close()
         except Exception:
@@ -221,33 +176,17 @@ async def pump_openai_to_twilio(openai_ws, twilio_ws: WebSocket, stream_sid: str
 
 @app.websocket("/media-stream")
 async def media_stream(twilio_ws: WebSocket):
-    """
-    WebSocket que recibe Twilio Media Streams (μ-law 8k, base64)
-    y puentea a OpenAI Realtime.
-    """
+    """WebSocket Twilio <-> OpenAI bridge."""
     await twilio_ws.accept()
 
-    # El primer mensaje de Twilio suele ser "start", lo leemos para obtener el streamSid
     start_msg_raw = await twilio_ws.receive_text()
     start_msg = json.loads(start_msg_raw)
-    if start_msg.get("event") != "start":
-        # Si no es "start", igual intenta extraer streamSid:
-        stream_sid = start_msg.get("streamSid", "unknown")
-    else:
-        stream_sid = start_msg["start"]["streamSid"]
+    stream_sid = start_msg.get("start", {}).get("streamSid", "unknown")
 
-    # Param bot para personalidad
     bot = (twilio_ws.query_params.get("bot") or "inhoustontx").strip().lower()
+    print(f"[WS-HANDSHAKE] /media-stream streamSid={stream_sid} bot={bot}")
 
-    print(f"[WS-HANDSHAKE] path=/media-stream streamSid={stream_sid} bot={bot}")
-
-    # Conexión a OpenAI
     if not OPENAI_API_KEY:
-        await twilio_ws.send_text(json.dumps({
-            "event": "mark",
-            "streamSid": stream_sid,
-            "mark": {"name": "no_openai_key"}
-        }))
         await twilio_ws.close()
         return
 
@@ -258,7 +197,6 @@ async def media_stream(twilio_ws: WebSocket):
         await twilio_ws.close()
         return
 
-    # Lanzamos el bombeo en paralelo
     task1 = asyncio.create_task(pump_twilio_to_openai(twilio_ws, openai_ws, stream_sid))
     task2 = asyncio.create_task(pump_openai_to_twilio(openai_ws, twilio_ws, stream_sid))
 
@@ -266,8 +204,6 @@ async def media_stream(twilio_ws: WebSocket):
         await asyncio.gather(task1, task2)
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        print(f"[WS] error: {e}")
     finally:
         try:
             await openai_ws.close()
