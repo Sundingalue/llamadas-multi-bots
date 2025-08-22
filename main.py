@@ -121,21 +121,22 @@ async def openai_connect(bot_key: str):
 
     bot = BOTS.get(bot_key, {})
     session_update = {
-        "type": "session.update",
-        "session": {
-            "voice": bot.get("voice", VOICE),   # ✅ Aquí definimos la voz (ej. nova)
-            "modalities": ["text", "audio"],
-            "input_audio_format": {
-                "type": "g711_ulaw",
-                "sample_rate": 8000
-            },
-            "audio_out": {
-                "format": "mulaw",
-                "sample_rate": 8000
-            },
-            "instructions": bot.get("instructions", "Eres un asistente virtual.")
-        }
+    "type": "session.update",
+    "session": {
+        "voice": bot.get("voice", VOICE),   # ✅ voz (ej. nova)
+        "modalities": ["text", "audio"],
+        "input_audio_format": {
+            "type": "g711_ulaw",
+            "sample_rate": 8000
+        },
+        "output_audio_format": {             # ✅ formato válido
+            "type": "g711_ulaw",
+            "sample_rate": 8000
+        },
+        "instructions": bot.get("instructions", "Eres un asistente virtual.")
     }
+}
+
     await ws.send(json.dumps(session_update))
     return ws
 
