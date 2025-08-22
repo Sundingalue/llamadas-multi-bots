@@ -3,7 +3,7 @@
 # - WS: /media-stream (acepta 'audio', carga bot por query ?bot=...)
 # - Enrutamiento por número: NUMBER_TO_BOT
 # - Normaliza voz (si el JSON trae algo no soportado, usa 'alloy')
-# - Genera audio pidiendo solo modalities=["audio"] (sin response.audio)
+# - Pide salida con modalities=["audio","text"] (válido para Realtime)
 
 import os, json, time, pathlib, threading, asyncio
 from dotenv import load_dotenv
@@ -250,12 +250,12 @@ async def media_stream(websocket: WebSocket):
                         }
                     })
 
-                    # Primer output: pedir audio SIN 'response.audio'
+                    # IMPORTANTE: modalidades válidas -> ['audio','text']
                     openai_send(ws_ai, {
                         "type": "response.create",
                         "response": {
                             "instructions": "Saluda brevemente según tu personalidad y ofrece ayuda.",
-                            "modalities": ["audio"]
+                            "modalities": ["audio", "text"]
                         }
                     })
 
