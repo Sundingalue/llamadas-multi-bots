@@ -80,7 +80,8 @@ async def voice(request: Request):
     # 🔑 usar wss:// (WebSocket seguro)
     stream_url = f"wss://llamadas-multi-bots.onrender.com/media-stream?bot={bot}"
 
-    track = "inbound_audio"  # estable
+    # ✅ FIX: track válido en Twilio
+    track = "inbound_track"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
