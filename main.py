@@ -16,15 +16,15 @@ from fastapi.responses import PlainTextResponse, Response
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
-VOICE = os.getenv("OPENAI_VOICE", "alloy")
+VOICE = os.getenv("OPENAI_VOICE", "nova")  # 🔊 cambié a Nova (voz femenina)
 
 APP_URL = os.getenv("APP_URL")  # ej: https://llamadas-multi-bots.onrender.com
 if not APP_URL:
     APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://example.invalid")
 
-# Bots en memoria
+# Bots en memoria (si quieres, puedes cargar desde /bots/inhoustontexas.json)
 BOTS: Dict[str, Dict[str, Any]] = {
-    "inhoustontx": {
+    "inhoustontexas": {
         "name": "Sara",
         "business_name": "In Houston Texas",
         "instructions": (
@@ -57,11 +57,12 @@ async def voice(request: Request):
     hacia nuestro WebSocket /media-stream.
     """
     params = dict(request.query_params)
-    bot = params.get("bot", "inhoustontx")
-    stream_url = f"{APP_URL.replace('http://', 'https://')}/media-stream?bot={bot}"
+    bot = params.get("bot", "inhoustontexas")
+    
+    # 🔑 usar wss:// (WebSocket seguro)
+    stream_url = f"wss://llamadas-multi-bots.onrender.com/media-stream?bot={bot}"
 
-    # ✅ Usar inbound_audio (seguro). both_tracks requiere habilitación especial.
-    track = "inbound_audio"
+    track = "inbound_audio"  # estable
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -98,7 +99,7 @@ async def openai_connect(bot_key: str):
         ("OpenAI-Beta", "realtime=v1"),
     ]
     ws = await websockets.connect(url, extra_headers=headers, max_size=16 * 1024 * 1024)
-    bot = BOTS.get(bot_key, BOTS["inhoustontx"])
+    bot = BOTS.get(bot_key, BOTS["inhoustontexas"])
     session_update = {
         "type": "session.update",
         "session": {
@@ -183,7 +184,7 @@ async def media_stream(twilio_ws: WebSocket):
     start_msg = json.loads(start_msg_raw)
     stream_sid = start_msg.get("start", {}).get("streamSid", "unknown")
 
-    bot = (twilio_ws.query_params.get("bot") or "inhoustontx").strip().lower()
+    bot = (twilio_ws.query_params.get("bot") or "inhoustontexas").strip().lower()
     print(f"[WS-HANDSHAKE] /media-stream streamSid={stream_sid} bot={bot}")
 
     if not OPENAI_API_KEY:
