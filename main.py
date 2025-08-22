@@ -3,7 +3,7 @@
 # - WS: /media-stream (acepta 'audio', carga bot por query ?bot=...)
 # - Enrutamiento por número: NUMBER_TO_BOT
 # - Normaliza voz (si el JSON trae algo no soportado, usa 'alloy')
-# - Audio OUT solicitado: g711_ulaw (8000 Hz); si Realtime lo rechaza, veremos el error en logs
+# - Genera audio pidiendo solo modalities=["audio"] (sin response.audio)
 
 import os, json, time, pathlib, threading, asyncio
 from dotenv import load_dotenv
@@ -54,7 +54,6 @@ def normalize_voice(v: str) -> str:
     supported = {"alloy", "verse", "aria", "sage"}
     if vlow in supported:
         return vlow
-    # mapeos comunes
     if vlow in {"nova", "mia", "polly.mia"}:
         return "alloy"
     return "alloy"
@@ -93,7 +92,6 @@ def root():
 # ========= TwiML /voice =========
 @app.api_route("/voice", methods=["POST", "GET"])
 async def voice(request: Request):
-    # Detectar número destino (Called/To) para elegir bot
     form = {}
     try:
         form = dict(await request.form())
@@ -111,7 +109,6 @@ async def voice(request: Request):
     vr.say("Conectando.", language="es-ES", voice="Polly.Mia")
 
     connect = Connect()
-    # SIN 'track' en <Connect><Stream> (evita Invalid Track Configuration)
     connect.stream(
         url=ws_url,
         status_callback=f"{PUBLIC_HTTP_BASE}/twilio/stream-status",
@@ -186,7 +183,6 @@ async def media_stream(websocket: WebSocket):
                 raw = ws_ai.recv()
                 if not raw:
                     break
-                # Intenta parsear, si falla, log raw
                 try:
                     payload = json.loads(raw)
                 except Exception:
@@ -211,13 +207,11 @@ async def media_stream(websocket: WebSocket):
                             "mark": {"name": "ai_response_done"}
                         })
                 elif mtype == "error":
-                    # LOG COMPLETO DEL ERROR
                     try:
                         print(f"[AI] ❌ error payload: {json.dumps(payload, ensure_ascii=False)}")
                     except Exception:
                         print(f"[AI] ❌ error payload (raw): {payload}")
                 else:
-                    # Info útil (session.created, etc.)
                     try:
                         snippet = json.dumps(payload, ensure_ascii=False)[:500]
                     except Exception:
@@ -247,7 +241,7 @@ async def media_stream(websocket: WebSocket):
                     ws_ai = openai_ws_connect(MODEL)
                     print("[AI] ✅ Conectado a OpenAI Realtime.")
 
-                    # 🔑 Mínimo válido: SOLO 'voice' e 'instructions'
+                    # Mínimo válido: SOLO 'voice' e 'instructions'
                     openai_send(ws_ai, {
                         "type": "session.update",
                         "session": {
@@ -256,17 +250,12 @@ async def media_stream(websocket: WebSocket):
                         }
                     })
 
-                    # Primer output (pedimos g711_ulaw/8k; si no es válido, veremos error payload)
+                    # Primer output: pedir audio SIN 'response.audio'
                     openai_send(ws_ai, {
                         "type": "response.create",
                         "response": {
                             "instructions": "Saluda brevemente según tu personalidad y ofrece ayuda.",
-                            "modalities": ["audio"],
-                            "audio": {
-                                "voice": VOICE,
-                                "format": "g711_ulaw",
-                                "sample_rate": 8000
-                            }
+                            "modalities": ["audio"]
                         }
                     })
 
