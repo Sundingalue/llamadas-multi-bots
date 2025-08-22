@@ -1,8 +1,9 @@
 # main.py — FastAPI + Twilio Connect/Stream + OpenAI Realtime (voz)
-# - Twilio: /voice (TwiML con <Connect><Stream>)
+# - Twilio: /voice (TwiML con <Connect><Stream> SIN 'track')
 # - WS: /media-stream (acepta 'audio', carga bot por query ?bot=...)
 # - Enrutamiento por número: NUMBER_TO_BOT
-# - Audio de salida: g711_ulaw (8000 Hz)
+# - Normaliza voz (si el JSON trae algo no soportado, usa 'alloy')
+# - Audio OUT: g711_ulaw (8000 Hz)
 
 import os, json, time, pathlib, threading, asyncio
 from dotenv import load_dotenv
@@ -16,18 +17,17 @@ app = FastAPI()
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-# ====== Enrutamiento por número (ajusta aquí) ======
+# ====== Enrutamiento por número ======
 NUMBER_TO_BOT = {
-    "+13469882323": "inhoustontexas",   # <- este número usa el bot de In Houston Texas
-    # "+1OTRO_NUMERO": "otro-bot",
+    "+13469882323": "inhoustontexas",  # número → bot
 }
 DEFAULT_BOT = "inhoustontexas"
 
 # URLs públicas (puedes dejarlas así o sobreescribir con env)
-PUBLIC_WS_BASE = os.environ.get("PUBLIC_WS_BASE", "wss://llamadas-multi-bots.onrender.com")
+PUBLIC_WS_BASE   = os.environ.get("PUBLIC_WS_BASE",   "wss://llamadas-multi-bots.onrender.com")
 PUBLIC_HTTP_BASE = os.environ.get("PUBLIC_HTTP_BASE", "https://llamadas-multi-bots.onrender.com")
 
-# ========= Bot config (JSON) =========
+# ========= Bot config =========
 def load_bot_config(bot_name: str) -> dict:
     cfg_path = BASE_DIR / "bots" / f"{bot_name}.json"
     try:
@@ -46,8 +46,26 @@ def _pick(cfg: dict, keys):
             return v.strip()
     return None
 
+def normalize_voice(v: str) -> str:
+    """Voces aceptadas por Realtime: usa 'alloy' si llega algo no soportado (p.ej. 'nova')."""
+    if not v:
+        return "alloy"
+    vlow = v.lower().strip()
+    # lista corta conocida; ajusta si quieres otras
+    supported = {"alloy", "verse", "aria", "sage"}
+    if vlow in supported:
+        return vlow
+    # mapeos comunes
+    if vlow in {"nova", "mia", "polly.mia"}:
+        return "alloy"
+    return "alloy"
+
 def get_voice(cfg: dict) -> str:
-    return _pick(cfg, ["voice", "voz"]) or os.environ.get("OPENAI_VOICE") or "nova"
+    raw = _pick(cfg, ["voice", "voz"]) or os.environ.get("OPENAI_VOICE") or "alloy"
+    v = normalize_voice(raw)
+    if v != raw:
+        print(f"[BOT] ⚠️ Voz '{raw}' no soportada en Realtime; usando '{v}'.")
+    return v
 
 def get_model(cfg: dict) -> str:
     return _pick(cfg, ["realtime_model", "model"]) or os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-4o-realtime-preview"
@@ -73,14 +91,10 @@ def openai_send(ws_ai, obj: dict):
 def root():
     return "✅ RT core activo (llamadas-multi-bots)."
 
-# ========= TwiML /voice (usa <Connect><Stream>) =========
+# ========= TwiML /voice =========
 @app.api_route("/voice", methods=["POST", "GET"])
 async def voice(request: Request):
-    """
-    Recibe la llamada de Twilio, detecta el número destino (Called),
-    resuelve el bot y construye el WS con ?bot=<name>.
-    """
-    # Twilio envía POST form-urlencoded
+    # Detectar número destino (Called/To) para elegir bot
     form = {}
     try:
         form = dict(await request.form())
@@ -89,7 +103,6 @@ async def voice(request: Request):
 
     called = (form.get("Called") or request.query_params.get("Called") or "").strip()
     if not called:
-        # Twilio también usa 'To' en algunos flujos
         called = (form.get("To") or request.query_params.get("To") or "").strip()
 
     bot_name = NUMBER_TO_BOT.get(called, DEFAULT_BOT)
@@ -99,7 +112,7 @@ async def voice(request: Request):
     vr.say("Conectando.", language="es-ES", voice="Polly.Mia")
 
     connect = Connect()
-    # IMPORTANTE: sin 'track' en <Connect><Stream> para evitar "Invalid Track configuration"
+    # SIN 'track' con <Connect><Stream> (evita Invalid Track Configuration)
     connect.stream(
         url=ws_url,
         status_callback=f"{PUBLIC_HTTP_BASE}/twilio/stream-status",
@@ -112,7 +125,7 @@ async def voice(request: Request):
     print(f"[VOICE-CONNECT] Called={called or 'N/A'} Bot={bot_name}\n{xml}")
     return Response(content=xml, media_type="text/xml")
 
-# ========= Callback de estado del Stream (diagnóstico) =========
+# ========= Callback de estado (diagnóstico) =========
 @app.post("/twilio/stream-status")
 async def twilio_stream_status(request: Request):
     try:
@@ -125,10 +138,8 @@ async def twilio_stream_status(request: Request):
 # ========= WebSocket Twilio =========
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
-    # Twilio suele enviar subprotocolo 'audio'
-    await websocket.accept(subprotocol="audio")
+    await websocket.accept(subprotocol="audio")  # Twilio usa 'audio'
 
-    # Log de handshake
     try:
         proto = websocket.headers.get("sec-websocket-protocol")
         ua = websocket.headers.get("user-agent")
@@ -137,7 +148,6 @@ async def media_stream(websocket: WebSocket):
     except Exception:
         pass
 
-    # Determinar el bot de la query (?bot=...)
     bot_name = websocket.query_params.get("bot") or DEFAULT_BOT
     bot_cfg = load_bot_config(bot_name)
     VOICE = get_voice(bot_cfg)
@@ -150,7 +160,6 @@ async def media_stream(websocket: WebSocket):
     started_at = time.time()
     stop_event = threading.Event()
 
-    # Cola para enviar mensajes hacia Twilio desde un hilo
     outq: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
@@ -166,7 +175,6 @@ async def media_stream(websocket: WebSocket):
     sender = asyncio.create_task(sender_task())
 
     def emit_to_twilio(obj: dict):
-        """Thread-safe: encolar envío hacia Twilio."""
         try:
             loop.call_soon_threadsafe(outq.put_nowait, obj)
         except Exception as e:
@@ -182,6 +190,7 @@ async def media_stream(websocket: WebSocket):
                 try:
                     payload = json.loads(raw)
                 except Exception:
+                    print("[AI] (binario o no-JSON)")
                     continue
 
                 mtype = payload.get("type")
@@ -201,10 +210,12 @@ async def media_stream(websocket: WebSocket):
                             "streamSid": stream_sid,
                             "mark": {"name": "ai_response_done"}
                         })
+                elif mtype == "error":
+                    # Log completo del error de OpenAI (clave para depurar)
+                    print(f"[AI] ❌ error payload: {json.dumps(payload, ensure_ascii=False)}")
                 else:
-                    if mtype not in ("input_audio_buffer.speech_started",
-                                     "input_audio_buffer.speech_stopped"):
-                        print(f"[AI] ← {mtype}")
+                    # Loguear otros tipos para diagnóstico (session.created, etc.)
+                    print(f"[AI] ← {mtype}: {json.dumps(payload, ensure_ascii=False)[:500]}")
         except Exception as e:
             print(f"[AI] ❌ Error leyendo WS Realtime: {e}")
 
@@ -260,7 +271,7 @@ async def media_stream(websocket: WebSocket):
                     print(f"[AI] ❌ No se pudo conectar a OpenAI Realtime: {e}")
 
             elif etype == "media":
-                # Próximo paso: enviar audio entrante a OpenAI (ASR/voice-in).
+                # TODO: enviar audio entrante a OpenAI (cuando habilitemos ASR/voice-in)
                 pass
 
             elif etype == "stop":
