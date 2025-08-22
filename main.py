@@ -1,8 +1,8 @@
 # main.py — FastAPI + Twilio Connect/Stream + OpenAI Realtime (voz)
-# - WS Twilio en /media-stream, aceptando subprotocolo 'audio'
-# - TwiML /voice usa <Connect><Stream> (más compatible que <Start>)
-# - Bot/persona desde bots/inhoustontexas.json (voz, modelo, prompt)
-# - Salida de audio OpenAI en g711_ulaw 8000 Hz hacia la llamada
+# - Twilio: /voice (TwiML con <Connect><Stream>)
+# - WS: /media-stream (acepta 'audio', carga bot por query ?bot=...)
+# - Enrutamiento por número: NUMBER_TO_BOT
+# - Audio de salida: g711_ulaw (8000 Hz)
 
 import os, json, time, pathlib, threading, asyncio
 from dotenv import load_dotenv
@@ -16,8 +16,19 @@ app = FastAPI()
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
+# ====== Enrutamiento por número (ajusta aquí) ======
+NUMBER_TO_BOT = {
+    "+13469882323": "inhoustontexas",   # <- este número usa el bot de In Houston Texas
+    # "+1OTRO_NUMERO": "otro-bot",
+}
+DEFAULT_BOT = "inhoustontexas"
+
+# URLs públicas (puedes dejarlas así o sobreescribir con env)
+PUBLIC_WS_BASE = os.environ.get("PUBLIC_WS_BASE", "wss://llamadas-multi-bots.onrender.com")
+PUBLIC_HTTP_BASE = os.environ.get("PUBLIC_HTTP_BASE", "https://llamadas-multi-bots.onrender.com")
+
 # ========= Bot config (JSON) =========
-def load_bot_config(bot_name: str = "inhoustontexas") -> dict:
+def load_bot_config(bot_name: str) -> dict:
     cfg_path = BASE_DIR / "bots" / f"{bot_name}.json"
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -64,25 +75,41 @@ def root():
 
 # ========= TwiML /voice (usa <Connect><Stream>) =========
 @app.api_route("/voice", methods=["POST", "GET"])
-def voice(request: Request):
-    # Fuerza WSS directo (puedes sobreescribir con PUBLIC_WS_URL si quieres)
-    ws_url = os.environ.get("PUBLIC_WS_URL", "wss://llamadas-multi-bots.onrender.com/media-stream")
+async def voice(request: Request):
+    """
+    Recibe la llamada de Twilio, detecta el número destino (Called),
+    resuelve el bot y construye el WS con ?bot=<name>.
+    """
+    # Twilio envía POST form-urlencoded
+    form = {}
+    try:
+        form = dict(await request.form())
+    except Exception:
+        pass
+
+    called = (form.get("Called") or request.query_params.get("Called") or "").strip()
+    if not called:
+        # Twilio también usa 'To' en algunos flujos
+        called = (form.get("To") or request.query_params.get("To") or "").strip()
+
+    bot_name = NUMBER_TO_BOT.get(called, DEFAULT_BOT)
+    ws_url = f"{PUBLIC_WS_BASE}/media-stream?bot={bot_name}"
 
     vr = VoiceResponse()
     vr.say("Conectando.", language="es-ES", voice="Polly.Mia")
 
     connect = Connect()
+    # IMPORTANTE: sin 'track' en <Connect><Stream> para evitar "Invalid Track configuration"
     connect.stream(
         url=ws_url,
-        track="both_tracks",
-        status_callback="https://llamadas-multi-bots.onrender.com/twilio/stream-status",
+        status_callback=f"{PUBLIC_HTTP_BASE}/twilio/stream-status",
         status_callback_method="POST",
         status_callback_event="start stop mark clear"
     )
     vr.append(connect)
 
     xml = str(vr)
-    print(f"[VOICE-CONNECT] TwiML enviado:\n{xml}")
+    print(f"[VOICE-CONNECT] Called={called or 'N/A'} Bot={bot_name}\n{xml}")
     return Response(content=xml, media_type="text/xml")
 
 # ========= Callback de estado del Stream (diagnóstico) =========
@@ -98,7 +125,7 @@ async def twilio_stream_status(request: Request):
 # ========= WebSocket Twilio =========
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
-    # Twilio exige subprotocolo 'audio'
+    # Twilio suele enviar subprotocolo 'audio'
     await websocket.accept(subprotocol="audio")
 
     # Log de handshake
@@ -110,12 +137,13 @@ async def media_stream(websocket: WebSocket):
     except Exception:
         pass
 
-    # Cargar bot/persona
-    bot_cfg = load_bot_config("inhoustontexas")
+    # Determinar el bot de la query (?bot=...)
+    bot_name = websocket.query_params.get("bot") or DEFAULT_BOT
+    bot_cfg = load_bot_config(bot_name)
     VOICE = get_voice(bot_cfg)
     MODEL = get_model(bot_cfg)
     INSTRUCTIONS = get_instructions(bot_cfg)
-    print(f"[BOT] voz={VOICE} model={MODEL}")
+    print(f"[BOT] bot={bot_name} voz={VOICE} model={MODEL}")
 
     stream_sid = None
     ws_ai = None
