@@ -1,22 +1,18 @@
-# main.py — Twilio <-> OpenAI Realtime (voz) con handshake WS correcto
-# - WS Twilio en /media-stream con subprotocolo 'audio' (eventlet.websocket)
-# - TwiML /voice con <Start><Stream> y statusCallback
+# main.py — FastAPI + Twilio Media Streams + OpenAI Realtime (voz)
+# - WS de Twilio en /media-stream aceptando subprotocolo 'audio'
+# - TwiML en /voice con <Start><Stream> + status callback
 # - Bot/persona desde bots/inhoustontexas.json
-# - Salida de audio OpenAI en g711_ulaw/8000 hacia la llamada
+# - Salida de audio OpenAI en g711_ulaw (8000 Hz) hacia la llamada
 
-import eventlet
-eventlet.monkey_patch()
-
-from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse, Start
+import os, json, time, pathlib, threading, asyncio
 from dotenv import load_dotenv
-from eventlet import websocket  # WebSocket server (handshake con subprotocolos)
-import websocket as wsclient     # websocket-client (cliente WS hacia OpenAI)
-import os, json, time, pathlib
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi.responses import PlainTextResponse
+from twilio.twiml.voice_response import VoiceResponse, Start
+import websocket as wsclient  # websocket-client (cliente WS hacia OpenAI)
 
 load_dotenv()
-app = Flask(__name__)
-
+app = FastAPI()
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
@@ -48,7 +44,7 @@ def get_model(cfg: dict) -> str:
     return _pick(cfg, ["realtime_model", "model"]) or os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-4o-realtime-preview"
 
 def get_instructions(cfg: dict) -> str:
-    return _pick(cfg, ["system_prompt", "instructions", "persona", "prompt"]) or \
+    return _pick(cfg, ["system_prompt","instructions","persona","prompt"]) or \
            "Eres un asistente de voz en tiempo real. Responde en español, breve y amable."
 
 # =========================
@@ -60,7 +56,6 @@ def openai_ws_connect(model: str):
         f"Authorization: Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta: realtime=v1"
     ]
-    # Cliente WS hacia OpenAI
     ws = wsclient.create_connection(url, header=headers, suppress_origin=True)
     return ws
 
@@ -68,28 +63,25 @@ def openai_send(ws_ai, obj: dict):
     ws_ai.send(json.dumps(obj))
 
 # =========================
-# Rutas HTTP (health + TwiML)
+# Health
 # =========================
-@app.route("/", methods=["GET"])
+@app.get("/", response_class=PlainTextResponse)
 def root():
-    return "✅ RT core activo (llamadas-multi-bots).", 200
+    return "✅ RT core activo (llamadas-multi-bots)."
 
-@app.route("/voice", methods=["POST", "GET"])
-def voice():
-    """
-    Devuelve TwiML que:
-    - Dice un breve mensaje (<Say>)
-    - Abre Stream WS a /media-stream (track=both_tracks)
-    - Envía statusCallback a /twilio/stream-status (start/stop/mark/clear)
-    """
+# =========================
+# TwiML /voice
+# =========================
+@app.api_route("/voice", methods=["POST", "GET"])
+def voice(request: Request):
     # URL WS pública
     base_ws = os.environ.get("PUBLIC_WS_URL")
     if not base_ws:
-        base = request.url_root.replace("https", "wss").replace("http", "ws").rstrip("/")
+        base = str(request.url_for("root")).replace("https", "wss").replace("http", "ws").rstrip("/")
         base_ws = f"{base}/media-stream"
 
-    # URL HTTP pública para callbacks
-    public_http = request.url_root.rstrip("/")
+    # URL HTTP para callbacks
+    public_http = str(request.url_for("root")).rstrip("/")
 
     vr = VoiceResponse()
     vr.say("Conectando con el asistente en tiempo real.", language="es-ES", voice="Polly.Mia")
@@ -103,28 +95,38 @@ def voice():
         status_callback_event="start stop mark clear"
     )
     vr.append(start)
-    return Response(str(vr), mimetype="text/xml")
+    xml = str(vr)
+    return Response(content=xml, media_type="text/xml")
 
-@app.route("/twilio/stream-status", methods=["POST"])
-def twilio_stream_status():
-    """ Recibe callbacks HTTP del <Stream> (diagnóstico de inicio/fin). """
+# =========================
+# Callback de estado del Stream (diagnóstico)
+# =========================
+@app.post("/twilio/stream-status")
+async def twilio_stream_status(request: Request):
     try:
-        form = request.form.to_dict()
-        print(f"[TWILIO-CB] {json.dumps(form)}")
+        body = (await request.body()).decode("utf-8", "ignore")
+        print(f"[TWILIO-CB] {body}")
     except Exception as e:
         print(f"[TWILIO-CB] error parseando: {e}")
-    return ("", 200)
+    return Response(status_code=200)
 
 # =========================
-# WebSocket Twilio (server)
+# WebSocket Twilio
 # =========================
-def twilio_media_ws(ws):
-    """
-    Handler del WebSocket de Twilio.
-    - Se acepta con subprotocolo 'audio' (ver wsgi_app).
-    - Al 'start' conectamos a OpenAI Realtime y enviamos saludo en g711_ulaw/8000.
-    - (Entrada de audio del usuario se activará en el siguiente paso).
-    """
+@app.websocket("/media-stream")
+async def media_stream(websocket: WebSocket):
+    # Aceptamos el subprotocolo 'audio' requerido por Twilio
+    await websocket.accept(subprotocol="audio")
+    # Logs de handshake
+    try:
+        proto = websocket.headers.get("sec-websocket-protocol")
+        ua = websocket.headers.get("user-agent")
+        host = websocket.headers.get("host")
+        print(f"[WS-HANDSHAKE] path=/media-stream host={host} proto={proto} ua={ua}")
+    except Exception:
+        pass
+
+    # Cargar bot y preparar OpenAI
     bot_cfg = load_bot_config("inhoustontexas")
     VOICE = get_voice(bot_cfg)
     MODEL = get_model(bot_cfg)
@@ -134,11 +136,14 @@ def twilio_media_ws(ws):
     stream_sid = None
     ws_ai = None
     started_at = time.time()
+    stop_event = threading.Event()
 
-    # Lee mensajes de OpenAI y reenvía audio a Twilio
-    def drain_ai():
+    async def send_to_twilio(obj: dict):
+        await websocket.send_text(json.dumps(obj))
+
+    def read_ai_forever():
         try:
-            while True:
+            while not stop_event.is_set():
                 raw = ws_ai.recv()
                 if not raw:
                     break
@@ -151,19 +156,20 @@ def twilio_media_ws(ws):
                 if mtype == "output_audio.delta":
                     b64audio = payload.get("audio") or payload.get("delta")
                     if b64audio and stream_sid:
-                        ws.send(json.dumps({
+                        obj = {
                             "event": "media",
                             "streamSid": stream_sid,
                             "media": {"payload": b64audio},
                             "track": "outbound"
-                        }))
+                        }
+                        asyncio.run(asyncio.create_task(send_to_twilio(obj)))
                 elif mtype == "response.completed":
                     if stream_sid:
-                        ws.send(json.dumps({
+                        asyncio.run(asyncio.create_task(send_to_twilio({
                             "event": "mark",
                             "streamSid": stream_sid,
                             "mark": {"name": "ai_response_done"}
-                        }))
+                        })))
                 else:
                     if mtype not in ("input_audio_buffer.speech_started",
                                      "input_audio_buffer.speech_stopped"):
@@ -173,10 +179,7 @@ def twilio_media_ws(ws):
 
     try:
         while True:
-            msg = ws.wait()
-            if msg is None:
-                break
-
+            msg = await websocket.receive_text()
             try:
                 data = json.loads(msg)
             except Exception:
@@ -195,7 +198,7 @@ def twilio_media_ws(ws):
                     ws_ai = openai_ws_connect(MODEL)
                     print("[AI] ✅ Conectado a OpenAI Realtime.")
 
-                    # Configurar sesión: voz + formato telefónico + instrucciones del bot
+                    # Configurar sesión con voz e instrucciones (g711_ulaw / 8k)
                     openai_send(ws_ai, {
                         "type": "session.update",
                         "session": {
@@ -206,7 +209,7 @@ def twilio_media_ws(ws):
                         }
                     })
 
-                    # Saludo inicial para validar flujo
+                    # Saludo inicial
                     openai_send(ws_ai, {
                         "type": "response.create",
                         "response": {
@@ -220,13 +223,14 @@ def twilio_media_ws(ws):
                         }
                     })
 
-                    eventlet.spawn_n(drain_ai)
+                    # Hilo que lee a OpenAI y reenvía audio a Twilio
+                    threading.Thread(target=read_ai_forever, daemon=True).start()
 
                 except Exception as e:
                     print(f"[AI] ❌ No se pudo conectar a OpenAI Realtime: {e}")
 
             elif etype == "media":
-                # Próximo paso: enviar audio entrante a OpenAI para ASR.
+                # (Próximo paso): enviar audio entrante a OpenAI para ASR.
                 pass
 
             elif etype == "stop":
@@ -234,40 +238,15 @@ def twilio_media_ws(ws):
                 print(f"[WS] ⏹ stop streamSid={stream_sid} duración={dur:.1f}s")
                 break
 
-    except websocket.WebSocketError:
-        print("[WS] 🔌 WS Twilio cerrado.")
+    except WebSocketDisconnect:
+        print("[WS] 🔌 WS Twilio desconectado.")
     except Exception as e:
         print(f"[WS] ❌ Error WS Twilio: {e}")
     finally:
         try:
+            stop_event.set()
             if ws_ai:
-                try:
-                    ws_ai.close()
-                except:
-                    pass
-            ws.close()
-        except:
-            pass
-        print("[WS] ✅ Media stream finalizado.")
-
-# =========================
-# Dispatcher WSGI
-# =========================
-def wsgi_app(environ, start_response):
-    path = environ.get("PATH_INFO", "")
-    if path == "/media-stream":
-        # Log del handshake para diagnóstico
-        proto_hdr = environ.get("HTTP_SEC_WEBSOCKET_PROTOCOL")
-        ua_hdr = environ.get("HTTP_USER_AGENT")
-        host = environ.get("HTTP_HOST")
-        print(f"[WS-HANDSHAKE] path={path} host={host} proto={proto_hdr} ua={ua_hdr}")
-
-        # Aceptar subprotocolo 'audio' que envía Twilio
-        return websocket.WebSocketWSGI(twilio_media_ws, protocols=["audio"])(environ, start_response)
-
-    # Resto de rutas -> Flask
-    return app.wsgi_app(environ, start_response)
-
-if __name__ == "__main__":
-    # Útil para pruebas locales (no usado en Render)
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+                try: ws_ai.close()
+                except: pass
+        finally:
+            print("[WS] ✅ Media stream finalizado.")
