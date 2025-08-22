@@ -16,28 +16,40 @@ from fastapi.responses import PlainTextResponse, Response
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
-VOICE = os.getenv("OPENAI_VOICE", "nova")  # 🔊 cambié a Nova (voz femenina)
+VOICE = os.getenv("OPENAI_VOICE", "nova")  # 🔊 Nova por defecto (femenina)
 
 APP_URL = os.getenv("APP_URL")  # ej: https://llamadas-multi-bots.onrender.com
 if not APP_URL:
     APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://example.invalid")
 
-# Bots en memoria (si quieres, puedes cargar desde /bots/inhoustontexas.json)
-BOTS: Dict[str, Dict[str, Any]] = {
-    "inhoustontexas": {
-        "name": "Sara",
-        "business_name": "In Houston Texas",
-        "instructions": (
-            "Eres Sara, del departamento de ventas de 'In Houston, Texas'. "
-            "Preséntate cordial, profesional, cercana y persuasiva, con lenguaje "
-            "humano y natural (español latino). Frases cortas, sin repetirte. "
-            "Guía siempre hacia una cita con el Sr. Sundin Galue. Usa un tono "
-            "cálido y convincente. Si el usuario dice hola, saluda: "
-            "‘Hola, Soy Sara, representante de ventas de In Houston Texas. "
-            "¿Con quién tengo el gusto?’"
-        ),
-    }
-}
+# =========================
+# CARGA DE BOTS DESDE JSON
+# =========================
+
+BOTS: Dict[str, Dict[str, Any]] = {}
+
+def load_bots():
+    """Carga todos los bots desde la carpeta /bots/*.json"""
+    global BOTS
+    BOTS = {}
+    bots_dir = os.path.join(os.path.dirname(__file__), "bots")
+    if not os.path.exists(bots_dir):
+        print("[BOTS] ⚠️ Carpeta bots/ no encontrada")
+        return
+
+    for fname in os.listdir(bots_dir):
+        if fname.endswith(".json"):
+            key = os.path.splitext(fname)[0].lower()
+            path = os.path.join(bots_dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    BOTS[key] = json.load(f)
+                print(f"[BOTS] ✅ Cargado: {fname}")
+            except Exception as e:
+                print(f"[BOTS] ❌ Error al cargar {fname}: {e}")
+
+# Cargar bots al inicio
+load_bots()
 
 app = FastAPI()
 
@@ -47,7 +59,13 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "llamadas-multi-bots", "model": MODEL, "voice": VOICE}
+    return {
+        "ok": True,
+        "service": "llamadas-multi-bots",
+        "model": MODEL,
+        "voice": VOICE,
+        "bots": list(BOTS.keys())
+    }
 
 
 @app.post("/voice")
@@ -57,8 +75,8 @@ async def voice(request: Request):
     hacia nuestro WebSocket /media-stream.
     """
     params = dict(request.query_params)
-    bot = params.get("bot", "inhoustontexas")
-    
+    bot = params.get("bot", "inhoustontexas").lower()
+
     # 🔑 usar wss:// (WebSocket seguro)
     stream_url = f"wss://llamadas-multi-bots.onrender.com/media-stream?bot={bot}"
 
@@ -99,22 +117,23 @@ async def openai_connect(bot_key: str):
         ("OpenAI-Beta", "realtime=v1"),
     ]
     ws = await websockets.connect(url, extra_headers=headers, max_size=16 * 1024 * 1024)
-    bot = BOTS.get(bot_key, BOTS["inhoustontexas"])
+
+    bot = BOTS.get(bot_key, {})
     session_update = {
         "type": "session.update",
         "session": {
-            "voice": VOICE,
+            "voice": bot.get("voice", VOICE),
             "modalities": ["text", "audio"],
             "input_audio_format": {
                 "type": "g711_ulaw",
                 "sample_rate": 8000
             },
-            "audio": {"voice": VOICE},
+            "audio": {"voice": bot.get("voice", VOICE)},
             "audio_out": {
                 "format": "mulaw",
                 "sample_rate": 8000
             },
-            "instructions": bot["instructions"]
+            "instructions": bot.get("instructions", "Eres un asistente virtual.")
         }
     }
     await ws.send(json.dumps(session_update))
